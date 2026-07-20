@@ -1,0 +1,22 @@
+{
+  "name": "@adviverse/games",
+  "version": "0.1.0",
+  "description": "Rewarded + interstitial ads for HTML5 / web games. Adviverse serves the ads — no third-party ad network needed.",
+  "type": "module",
+  "main": "dist/index.js",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" }
+  },
+  "files": ["dist", "README.md"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "keywords": ["adviverse", "ads", "rewarded", "interstitial", "html5", "game", "webgl"],
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "typescript": "^5.6.2"
+  }
+}
