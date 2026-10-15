@@ -66,3 +66,13 @@ function onLevelComplete() {
 - **Reward integrity** — never grant on `onClose` alone. The signed callback is
   the trust anchor; for hardened server-side verification, have *your* server
   call the `reward_url` and grant on `rewarded: true`.
+
+## Third-party VAST tags (0.2.0+)
+
+Video creatives may be an advertiser's own ad-server **VAST tag** instead of a
+hosted file. The SDK requests them (`vast=1`) and resolves them before showing:
+it follows the Wrapper chain (≤5 hops), plays the best MP4/WebM `MediaFile`, and
+fires the tag's Impression / quartile / click tracking alongside Adviverse's.
+Clicks open the advertiser's ClickThrough. If the tag can't be resolved or the
+media fails, the ad is reported as `onError('no_fill')` and a rewarded ad never
+grants. The advertiser's ad server must allow CORS (as for any web VAST player).

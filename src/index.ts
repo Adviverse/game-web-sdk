@@ -9,6 +9,11 @@
 // Framework-free, dependency-free, works in any browser game (vanilla canvas,
 // Phaser, PixiJS, Construct, Unity/Godot WebGL via their JS bridges).
 
+import { resolveVast, pixel, VastError, VastTracker, type VastResult } from './vast.js';
+
+export { resolveVast } from './vast.js';
+export type { VastResult } from './vast.js';
+
 const DEFAULT_BASE = 'https://serve.adviverse.com';
 
 export interface GamesConfig {
@@ -33,6 +38,8 @@ export interface Creative {
   brand_name?: string;
   duration?: number;
   skip_offset_sec?: number;
+  /** Third-party VAST tag; when asset_url is empty the SDK resolves it. */
+  vast_tag_url?: string;
 }
 
 interface AdResponse {
@@ -135,7 +142,20 @@ export class AdviverseGames {
         opts.onError?.('no_fill');
         return;
       }
-      await this.present(format, ad, opts);
+      // Third-party VAST tag (no hosted asset): resolve it to a playable
+      // MediaFile first. Any failure fires the chain's <Error> + ours and is a
+      // no-fill — the ad never shows, so a rewarded one can never grant.
+      let ext: VastResult | undefined;
+      if (!ad.creative.asset_url && ad.creative.vast_tag_url) {
+        const { code, res } = await resolveVast(ad.creative.vast_tag_url);
+        if (code) {
+          this.vastFail(ad, res, code);
+          opts.onError?.('no_fill');
+          return;
+        }
+        ext = res;
+      }
+      await this.present(format, ad, opts, ext);
     } catch (e) {
       opts.onError?.(e instanceof Error ? e.message : 'error');
     } finally {
@@ -149,6 +169,8 @@ export class AdviverseGames {
       format,
       client: this.client,
       uid: opts.uid || this.uid,
+      // Wrapper creatives (third-party VAST tags) are resolvable client-side.
+      vast: '1',
     });
     if (this.consent?.gdpr) q.set('gdpr_consent', this.consent.gdpr);
     if (this.consent?.usPrivacy) q.set('us_privacy', this.consent.usPrivacy);
@@ -161,12 +183,30 @@ export class AdviverseGames {
   // present builds the full-screen overlay, plays the creative, fires the
   // impression once it's on screen, wires the click, and resolves after the ad
   // closes. Rewarded gates the close on completion and verifies the reward.
-  private present(format: string, ad: AdResponse, opts: ShowOptions): Promise<void> {
+  // vastFail reports a VAST resolution/playback failure: the chain's <Error>
+  // URLs with [ERRORCODE] + OUR tracking-only error beacon (never billing).
+  private vastFail(ad: AdResponse, res: VastResult, code: number): void {
+    new VastTracker(res).error(code);
+    pixel(`${this.base}${ad.imp_url}&ev=error&code=${code}`);
+  }
+
+  private present(format: string, ad: AdResponse, opts: ShowOptions, ext?: VastResult): Promise<void> {
     injectStyles();
     return new Promise<void>((resolve) => {
       const cr = ad.creative;
-      const isVideo = (cr.type || '').toLowerCase() === 'video' && !!cr.asset_url;
+      const mediaUrl = ext?.media?.url || cr.asset_url || '';
+      const isVideo = (cr.type || '').toLowerCase() === 'video' && !!mediaUrl;
+      const vt = ext ? new VastTracker(ext) : null;
+      const isPlayable = (cr.type || '').toLowerCase() === 'html5' && /^https?:\/\//.test(cr.asset_url || '');
       const rewarded = format === 'rewarded';
+
+      // Playable (interactive HTML5): mount the sandboxed unit + bridge and skip
+      // the media/countdown path entirely. Same trust model as the web SDK — the
+      // frame is origin-"null" and only its own window's messages are honored.
+      if (isPlayable) {
+        this.presentPlayable(ad, rewarded, opts, resolve);
+        return;
+      }
 
       const ov = document.createElement('div');
       ov.className = 'adv-g-ov';
@@ -198,8 +238,15 @@ export class AdviverseGames {
       };
 
       const openClick = () => {
+        // VAST: open the advertiser's ClickThrough and record OUR click via
+        // /click?track=1 (pixel, no redirect) + the chain's ClickTracking.
+        const viaVast = !!(vt && ext && ext.clickThrough);
+        if (viaVast) {
+          pixel(`${this.base}${ad.click_url}&track=1`);
+          vt?.clicked();
+        }
         try {
-          window.open(`${this.base}${ad.click_url}`, '_blank', 'noopener');
+          window.open(viaVast ? ext!.clickThrough : `${this.base}${ad.click_url}`, '_blank', 'noopener');
         } catch {
           /* pop-up blocked — ignore */
         }
@@ -227,21 +274,29 @@ export class AdviverseGames {
         }
       };
       closeBtn.addEventListener('click', async () => {
+        if (vt) {
+          if (!completed) vt.fire('skip');
+          vt.fire('closeLinear');
+        }
         await grantIfEarned();
         finishClose();
       });
 
       // The duration that must elapse before the player may close. For video we
       // prefer the media's own end; this is the fallback / interstitial skip.
-      const skipAfter = rewarded
-        ? Math.max(1, cr.duration || (isVideo ? 15 : 5))
+      // VAST: interstitials honour the tag's skipoffset (absent = not
+      // skippable before the media ends); duration falls back to <Duration>.
+      const dur = cr.duration || ext?.duration || 0;
+      let skipAfter = rewarded
+        ? Math.max(1, dur || (isVideo ? 15 : 5))
         : Math.max(1, cr.skip_offset_sec || 5);
+      if (ext && !rewarded) skipAfter = Math.max(1, ext.skipOffset >= 0 ? ext.skipOffset : dur || 15);
 
       let media: HTMLVideoElement | HTMLImageElement;
       if (isVideo) {
         const v = document.createElement('video');
         v.className = 'adv-g-media';
-        v.src = cr.asset_url as string;
+        v.src = mediaUrl;
         v.autoplay = true;
         v.muted = true; // required for autoplay; player can unmute via controls
         (v as HTMLVideoElement).playsInline = true;
@@ -251,6 +306,13 @@ export class AdviverseGames {
           markClosable();
         });
         v.addEventListener('click', openClick);
+        if (vt) this.trackVideo(v, vt, ad, ext as VastResult, () => {
+          // Media failed: error beacons, tear down, no-fill — never a reward.
+          clearInterval(iv);
+          teardown();
+          opts.onError?.('no_fill');
+          resolve();
+        });
         v.play?.().catch(() => fireImp());
         media = v;
       } else {
@@ -296,6 +358,113 @@ export class AdviverseGames {
       // Image with cache hit may not fire load — ensure the impression lands.
       if (!isVideo) setTimeout(fireImp, 300);
     });
+  }
+
+  // trackVideo wires the third-party VAST tracking onto the <video> element
+  // (our own impression/click beacons are unchanged) and reports media errors.
+  private trackVideo(v: HTMLVideoElement, vt: VastTracker, ad: AdResponse, ext: VastResult, onFail: () => void): void {
+    let started = false;
+    let failed = false;
+    v.addEventListener('playing', () => {
+      if (!started) {
+        started = true;
+        vt.started();
+      } else vt.fire('resume', false);
+    });
+    v.addEventListener('timeupdate', () => vt.progress(v.currentTime, v.duration));
+    v.addEventListener('ended', () => vt.fire('complete'));
+    v.addEventListener('pause', () => {
+      if (!v.ended) vt.fire('pause', false);
+    });
+    v.addEventListener('volumechange', () => vt.fire(v.muted ? 'mute' : 'unmute', false));
+    v.addEventListener('error', () => {
+      if (failed) return;
+      failed = true;
+      const code = started ? VastError.MEDIA_PLAY : VastError.MEDIA_NOT_FOUND;
+      this.vastFail(ad, ext, code);
+      onFail();
+    });
+  }
+
+  // presentPlayable mounts an interactive HTML5 unit in a locked-down iframe.
+  // The bundle's injected runtime posts {__advPlayable} messages; we honor them
+  // ONLY from this frame's own window (the sandbox makes the origin "null", so
+  // window identity is the trust check) and map ready→impression, click→open,
+  // finish→completed (rewarded), close→dismiss.
+  private presentPlayable(
+    ad: AdResponse,
+    rewarded: boolean,
+    opts: ShowOptions,
+    resolve: () => void,
+  ): void {
+    const ov = document.createElement('div');
+    ov.className = 'adv-g-ov';
+
+    const label = document.createElement('span');
+    label.className = 'adv-g-label';
+    label.textContent = 'Ad';
+    ov.appendChild(label);
+
+    const closeBtn = document.createElement('button');
+    closeBtn.className = 'adv-g-close show';
+    closeBtn.setAttribute('aria-label', 'Close ad');
+    closeBtn.textContent = '×';
+    ov.appendChild(closeBtn);
+
+    const frame = document.createElement('iframe');
+    frame.className = 'adv-g-media';
+    frame.setAttribute('sandbox', 'allow-scripts');
+    frame.setAttribute('allow', 'autoplay; fullscreen');
+    frame.style.cssText = 'border:0;width:100%;height:100%;background:#000';
+    frame.src = ad.creative.asset_url as string;
+    ov.appendChild(frame);
+
+    let impFired = false;
+    let completed = false;
+    let done = false;
+    const teardown = () => {
+      if (done) return;
+      done = true;
+      window.removeEventListener('message', onMsg);
+      ov.remove();
+    };
+    const finishClose = async () => {
+      if (rewarded && completed && ad.reward_url) {
+        const ok = await this.confirmReward(ad.reward_url);
+        if (ok) opts.onReward?.();
+        else opts.onError?.('reward_unverified');
+      }
+      teardown();
+      opts.onClose?.();
+      resolve();
+    };
+
+    const onMsg = (e: MessageEvent) => {
+      if (e.source !== frame.contentWindow) return; // trust only this frame
+      const d = e.data as { __advPlayable?: number; type?: string } | null;
+      if (!d || d.__advPlayable !== 1) return;
+      if (d.type === 'ready' && !impFired) {
+        impFired = true;
+        try {
+          navigator.sendBeacon?.(`${this.base}${ad.imp_url}`);
+        } catch {
+          /* best effort */
+        }
+      } else if (d.type === 'click') {
+        try {
+          window.open(`${this.base}${ad.click_url}`, '_blank', 'noopener');
+        } catch {
+          /* blocked */
+        }
+      } else if (d.type === 'finish') {
+        completed = true;
+      } else if (d.type === 'close') {
+        void finishClose();
+      }
+    };
+    window.addEventListener('message', onMsg);
+    closeBtn.addEventListener('click', () => void finishClose());
+    document.body.appendChild(ov);
   }
 
   // confirmReward calls the signed reward_url and grants only on rewarded:true.

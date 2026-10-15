@@ -1,6 +1,6 @@
 {
   "name": "@adviverse/games",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Rewarded + interstitial ads for HTML5 / web games. Adviverse serves the ads — no third-party ad network needed.",
   "type": "module",
   "main": "dist/index.js",
